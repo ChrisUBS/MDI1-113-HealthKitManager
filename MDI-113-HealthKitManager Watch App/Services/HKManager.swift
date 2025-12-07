@@ -9,75 +9,70 @@ import Foundation
 import HealthKit
 import Combine
 
-class HKManager: ObservableObject {
+class HKManager: HRManagerProtocol {
+    
+    @Published var latestHeartRate: Double = 0
+    @Published var allHeartRates: [HKQuantitySample] = []
+    
     private let healthStore = HKHealthStore()
-    
-    @Published var heartRate: [HKQuantitySample] = []
-    
+    private var anchor: HKQueryAnchor?
+
     init() {
-        requestHKAuthorization()
+        requestAuthorization()
     }
     
-    private func requestHKAuthorization() {
-        let typesToShare: Set = [
-            HKObjectType.quantityType(forIdentifier: .heartRate)!,
-            HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)!
-        ]
-        
-        let typesToRead: Set = [
-            HKObjectType.quantityType(forIdentifier: .heartRate)!,
-            HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned)!
-        ]
-        
-        healthStore.requestAuthorization(toShare: typesToShare, read: typesToRead) { (success, error) in
+    func start() {
+        startStreamingHeartRate()
+    }
+    
+    private func requestAuthorization() {
+        guard let hrType = HKObjectType.quantityType(forIdentifier: .heartRate) else { return }
+
+        let typesToRead: Set<HKObjectType> = [hrType]
+        let typesToShare: Set<HKSampleType> = []
+
+        healthStore.requestAuthorization(toShare: typesToShare, read: typesToRead) { success, error in
             if success {
-                self.startTrackingHKData()
+                self.startStreamingHeartRate()
+            } else {
+                print("❌ HealthKit authorization failed: \(String(describing: error))")
             }
         }
     }
     
-    func startTrackingHKData() {
-        guard let heartRateType = HKObjectType.quantityType(forIdentifier: .heartRate) else { return }
-        let startDate = Calendar.current.startOfDay(for: Date())
-        let timePredicate = HKQuery.predicateForSamples(withStart: startDate, end: Date())
-        
-        let query = HKSampleQuery(
-            sampleType: heartRateType,
-            predicate: timePredicate,
-            limit: 100,
-            sortDescriptors: [
-                NSSortDescriptor(key: "startDate", ascending: true)
-            ]
-            // resultHandler goes here
-        ) { (_, samples, _) in // or here (resultHandler)
-            DispatchQueue.main.async {
-                self.heartRate = (samples as? [HKQuantitySample]) ?? []
-            }
+    private func startStreamingHeartRate() {
+        guard let hrType = HKObjectType.quantityType(forIdentifier: .heartRate) else { return }
+
+        let query = HKAnchoredObjectQuery(
+            type: hrType,
+            predicate: nil,
+            anchor: anchor,
+            limit: HKObjectQueryNoLimit
+        ) { query, samples, deleted, newAnchor, error in
+            self.process(samples: samples, newAnchor: newAnchor)
         }
-        
+
+        // Realtime incremental updates
+        query.updateHandler = { query, samples, deleted, newAnchor, error in
+            self.process(samples: samples, newAnchor: newAnchor)
+        }
+
         healthStore.execute(query)
     }
     
-    func addHeartRate(_ bpm: Double) {
-        guard let heartRateType = HKObjectType.quantityType(forIdentifier: .heartRate) else { return }
-        
-        let hkQuantity = HKQuantity(
-            unit: HKUnit.count().unitDivided(by: .minute()),
-            doubleValue: bpm
-        )
-        
-        let now = Date()
-        
-        let sample = HKQuantitySample(
-            type: heartRateType,
-            quantity: hkQuantity,
-            start: now,
-            end: now
-        )
-        
-        healthStore.save(sample) { success, _ in
-            if success {
-                self.startTrackingHKData()
+    private func process(samples: [HKSample]?, newAnchor: HKQueryAnchor?) {
+        DispatchQueue.main.async {
+            self.anchor = newAnchor
+            
+            guard let samples = samples as? [HKQuantitySample], !samples.isEmpty else { return }
+
+            // Append to history for chart UI
+            self.allHeartRates.append(contentsOf: samples)
+
+            // Extract the latest value
+            if let last = samples.last {
+                let bpm = last.quantity.doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
+                self.latestHeartRate = bpm
             }
         }
     }
